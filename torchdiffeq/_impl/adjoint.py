@@ -4,6 +4,48 @@ import torch.nn as nn
 from .odeint import SOLVERS, odeint
 from .misc import _check_inputs, _flat_to_shape, _mixed_norm, _all_callback_names, _all_adjoint_callback_names
 
+class AugmentedSystem(nn.Module):
+    def __init__(self, func, adjoint_params, t_requires_grad):
+        super(AugmentedSystem, self).__init__()
+        self.func = func
+        self.adjoint_params = adjoint_params
+        self.t_requires_grad = t_requires_grad
+
+    def forward(self, t, y_aug):
+        # Dynamics of the original system augmented with
+        # the adjoint wrt y, and an integrator wrt t and args.
+        y = y_aug[1]
+        adj_y = y_aug[2]
+        # ignore gradients wrt time and parameters
+
+        with torch.enable_grad():
+            t_ = t.detach()
+            t = t_.requires_grad_(True)
+            y = y.detach().requires_grad_(True)
+
+            # If using an adaptive solver we don't want to waste time resolving dL/dt unless we need it (which
+            # doesn't necessarily even exist if there is piecewise structure in time), so turning off gradients
+            # wrt t here means we won't compute that if we don't need it.
+            func_eval = self.func(t if self.t_requires_grad else t_, y)
+
+            # Workaround for PyTorch bug #39784
+            _t = torch.as_strided(t, (), ())  # noqa
+            _y = torch.as_strided(y, (), ())  # noqa
+            _params = tuple(torch.as_strided(param, (), ()) for param in self.adjoint_params)  # noqa
+
+            vjp_t, vjp_y, *vjp_params = torch.autograd.grad(
+                func_eval, (t, y) + self.adjoint_params, -adj_y,
+                allow_unused=True, retain_graph=True, create_graph=True
+            )
+
+        # autograd.grad returns None if no gradient, set to zero.
+        vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
+        vjp_y = torch.zeros_like(y) if vjp_y is None else vjp_y
+        vjp_params = [torch.zeros_like(param) if vjp_param is None else vjp_param
+                      for param, vjp_param in zip(self.adjoint_params, vjp_params)]
+
+        return (vjp_t, func_eval, vjp_y, *vjp_params)
+
 
 class OdeintAdjointMethod(torch.autograd.Function):
 
@@ -34,121 +76,123 @@ class OdeintAdjointMethod(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_y):
-        with torch.no_grad():
-            func = ctx.func
-            adjoint_rtol = ctx.adjoint_rtol
-            adjoint_atol = ctx.adjoint_atol
-            adjoint_method = ctx.adjoint_method
-            adjoint_options = ctx.adjoint_options
-            t_requires_grad = ctx.t_requires_grad
+        #with torch.no_grad():
+        func = ctx.func
+        adjoint_rtol = ctx.adjoint_rtol
+        adjoint_atol = ctx.adjoint_atol
+        adjoint_method = ctx.adjoint_method
+        adjoint_options = ctx.adjoint_options
+        t_requires_grad = ctx.t_requires_grad
 
-            # Backprop as if integrating up to event time.
-            # Does NOT backpropagate through the event time.
-            event_mode = ctx.event_mode
-            if event_mode:
-                t, y, event_t, *adjoint_params = ctx.saved_tensors
-                _t = t
-                t = torch.cat([t[0].reshape(-1), event_t.reshape(-1)])
-                grad_y = grad_y[1]
+        # Backprop as if integrating up to event time.
+        # Does NOT backpropagate through the event time.
+        event_mode = ctx.event_mode
+        if event_mode:
+            t, y, event_t, *adjoint_params = ctx.saved_tensors
+            _t = t
+            t = torch.cat([t[0].reshape(-1), event_t.reshape(-1)])
+            grad_y = grad_y[1]
+        else:
+            t, y, *adjoint_params = ctx.saved_tensors
+            grad_y = grad_y[0]
+
+        adjoint_params = tuple(adjoint_params)
+
+        ##################################
+        #      Set up initial state      #
+        ##################################
+
+        # [-1] because y and grad_y are both of shape (len(t), *y0.shape)
+        aug_state = [torch.zeros((), dtype=y.dtype, device=y.device), y[-1], grad_y[-1]]  # vjp_t, y, vjp_y
+        aug_state.extend([torch.zeros_like(param) for param in adjoint_params])  # vjp_params
+
+        ##################################
+        #    Set up backward ODE func    #
+        ##################################
+
+        # TODO: use a nn.Module and call odeint_adjoint to implement higher order derivatives.
+        # def augmented_dynamics(t, y_aug):
+        #             #     # Dynamics of the original system augmented with
+        #             #     # the adjoint wrt y, and an integrator wrt t and args.
+        #             #     y = y_aug[1]
+        #             #     adj_y = y_aug[2]
+        #             #     # ignore gradients wrt time and parameters
+        #             #
+        #             #     with torch.enable_grad():
+        #             #         t_ = t.detach()
+        #             #         t = t_.requires_grad_(True)
+        #             #         y = y.detach().requires_grad_(True)
+        #             #
+        #             #         # If using an adaptive solver we don't want to waste time resolving dL/dt unless we need it (which
+        #             #         # doesn't necessarily even exist if there is piecewise structure in time), so turning off gradients
+        #             #         # wrt t here means we won't compute that if we don't need it.
+        #             #         func_eval = func(t if t_requires_grad else t_, y)
+        #             #
+        #             #         # Workaround for PyTorch bug #39784
+        #             #         _t = torch.as_strided(t, (), ())  # noqa
+        #             #         _y = torch.as_strided(y, (), ())  # noqa
+        #             #         _params = tuple(torch.as_strided(param, (), ()) for param in adjoint_params)  # noqa
+        #             #
+        #             #         vjp_t, vjp_y, *vjp_params = torch.autograd.grad(
+        #             #             func_eval, (t, y) + adjoint_params, -adj_y,
+        #             #             allow_unused=True, retain_graph=True
+        #             #         )
+        #             #
+        #             #     # autograd.grad returns None if no gradient, set to zero.
+        #             #     vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
+        #             #     vjp_y = torch.zeros_like(y) if vjp_y is None else vjp_y
+        #             #     vjp_params = [torch.zeros_like(param) if vjp_param is None else vjp_param
+        #             #                   for param, vjp_param in zip(adjoint_params, vjp_params)]
+        #             #
+        #             #     return (vjp_t, func_eval, vjp_y, *vjp_params)
+
+        augmented_dynamics = AugmentedSystem(func, adjoint_params, t_requires_grad)
+
+        # Add adjoint callbacks
+        for callback_name, adjoint_callback_name in zip(_all_callback_names, _all_adjoint_callback_names):
+            try:
+                callback = getattr(func, adjoint_callback_name)
+            except AttributeError:
+                pass
             else:
-                t, y, *adjoint_params = ctx.saved_tensors
-                grad_y = grad_y[0]
+                setattr(augmented_dynamics, callback_name, callback)
 
-            adjoint_params = tuple(adjoint_params)
+        ##################################
+        #       Solve adjoint ODE        #
+        ##################################
 
-            ##################################
-            #      Set up initial state      #
-            ##################################
-
-            # [-1] because y and grad_y are both of shape (len(t), *y0.shape)
-            aug_state = [torch.zeros((), dtype=y.dtype, device=y.device), y[-1], grad_y[-1]]  # vjp_t, y, vjp_y
-            aug_state.extend([torch.zeros_like(param) for param in adjoint_params])  # vjp_params
-
-            ##################################
-            #    Set up backward ODE func    #
-            ##################################
-
-            # TODO: use a nn.Module and call odeint_adjoint to implement higher order derivatives.
-            def augmented_dynamics(t, y_aug):
-                # Dynamics of the original system augmented with
-                # the adjoint wrt y, and an integrator wrt t and args.
-                y = y_aug[1]
-                adj_y = y_aug[2]
-                # ignore gradients wrt time and parameters
-
-                with torch.enable_grad():
-                    t_ = t.detach()
-                    t = t_.requires_grad_(True)
-                    y = y.detach().requires_grad_(True)
-
-                    # If using an adaptive solver we don't want to waste time resolving dL/dt unless we need it (which
-                    # doesn't necessarily even exist if there is piecewise structure in time), so turning off gradients
-                    # wrt t here means we won't compute that if we don't need it.
-                    func_eval = func(t if t_requires_grad else t_, y)
-
-                    # Workaround for PyTorch bug #39784
-                    _t = torch.as_strided(t, (), ())  # noqa
-                    _y = torch.as_strided(y, (), ())  # noqa
-                    _params = tuple(torch.as_strided(param, (), ()) for param in adjoint_params)  # noqa
-
-                    vjp_t, vjp_y, *vjp_params = torch.autograd.grad(
-                        func_eval, (t, y) + adjoint_params, -adj_y,
-                        allow_unused=True, retain_graph=True
-                    )
-
-                # autograd.grad returns None if no gradient, set to zero.
-                vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
-                vjp_y = torch.zeros_like(y) if vjp_y is None else vjp_y
-                vjp_params = [torch.zeros_like(param) if vjp_param is None else vjp_param
-                              for param, vjp_param in zip(adjoint_params, vjp_params)]
-
-                return (vjp_t, func_eval, vjp_y, *vjp_params)
-
-            # Add adjoint callbacks
-            for callback_name, adjoint_callback_name in zip(_all_callback_names, _all_adjoint_callback_names):
-                try:
-                    callback = getattr(func, adjoint_callback_name)
-                except AttributeError:
-                    pass
-                else:
-                    setattr(augmented_dynamics, callback_name, callback)
-
-            ##################################
-            #       Solve adjoint ODE        #
-            ##################################
-
+        if t_requires_grad:
+            time_vjps = torch.empty(len(t), dtype=t.dtype, device=t.device)
+        else:
+            time_vjps = None
+        for i in range(len(t) - 1, 0, -1):
             if t_requires_grad:
-                time_vjps = torch.empty(len(t), dtype=t.dtype, device=t.device)
-            else:
-                time_vjps = None
-            for i in range(len(t) - 1, 0, -1):
-                if t_requires_grad:
-                    # Compute the effect of moving the current time measurement point.
-                    # We don't compute this unless we need to, to save some computation.
-                    func_eval = func(t[i], y[i])
-                    dLd_cur_t = func_eval.reshape(-1).dot(grad_y[i].reshape(-1))
-                    aug_state[0] -= dLd_cur_t
-                    time_vjps[i] = dLd_cur_t
+                # Compute the effect of moving the current time measurement point.
+                # We don't compute this unless we need to, to save some computation.
+                func_eval = func(t[i], y[i])
+                dLd_cur_t = func_eval.reshape(-1).dot(grad_y[i].reshape(-1))
+                aug_state[0] -= dLd_cur_t
+                time_vjps[i] = dLd_cur_t
 
-                # Run the augmented system backwards in time.
-                aug_state = odeint(
-                    augmented_dynamics, tuple(aug_state),
-                    t[i - 1:i + 1].flip(0),
-                    rtol=adjoint_rtol, atol=adjoint_atol, method=adjoint_method, options=adjoint_options
-                )
-                aug_state = [a[1] for a in aug_state]  # extract just the t[i - 1] value
-                aug_state[1] = y[i - 1]  # update to use our forward-pass estimate of the state
-                aug_state[2] += grad_y[i - 1]  # update any gradients wrt state at this time point
+            # Run the augmented system backwards in time.
+            aug_state = odeint_adjoint(
+                augmented_dynamics, tuple(aug_state),
+                t[i - 1:i + 1].flip(0),
+                rtol=adjoint_rtol, atol=adjoint_atol, method=adjoint_method, options=adjoint_options
+            )
+            aug_state = [a[1] for a in aug_state]  # extract just the t[i - 1] value
+            aug_state[1] = y[i - 1]  # update to use our forward-pass estimate of the state
+            aug_state[2] = aug_state[2] + grad_y[i - 1]  # update any gradients wrt state at this time point
 
-            if t_requires_grad:
-                time_vjps[0] = aug_state[0]
+        if t_requires_grad:
+            time_vjps[0] = aug_state[0]
 
-            # Only compute gradient wrt initial time when in event handling mode.
-            if event_mode and t_requires_grad:
-                time_vjps = torch.cat([time_vjps[0].reshape(-1), torch.zeros_like(_t[1:])])
+        # Only compute gradient wrt initial time when in event handling mode.
+        if event_mode and t_requires_grad:
+            time_vjps = torch.cat([time_vjps[0].reshape(-1), torch.zeros_like(_t[1:])])
 
-            adj_y = aug_state[2]
-            adj_params = aug_state[3:]
+        adj_y = aug_state[2]
+        adj_params = aug_state[3:]
 
         return (None, None, adj_y, time_vjps, None, None, None, None, None, None, None, None, None, None, *adj_params)
 
